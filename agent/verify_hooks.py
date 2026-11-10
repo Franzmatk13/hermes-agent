@@ -34,6 +34,17 @@ def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
         return DEFAULT_MAX_VERIFY_NUDGES
 
 
+def pre_verify_always(config: Optional[dict[str, Any]] = None) -> bool:
+    """Whether ``pre_verify`` may fire on turns that edited no files.
+
+    Default ``False`` keeps the historical scope (the gate opens only after file edits).
+    ``agent.pre_verify_always: true`` is for hooks whose policy is not about file edits;
+    they still receive ``changed_paths`` and ``max_verify_nudges`` still bounds the loop.
+    Same key as upstream PR #116588.
+    """
+    return is_truthy_value(_agent_cfg(config).get("pre_verify_always", False), default=False)
+
+
 def coding_verify_guidance(config: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Return the optional guidance appended to verification-stop nudges."""
     if not is_truthy_value(_agent_cfg(config).get("verify_guidance", True), default=True):
@@ -53,4 +64,4 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     return agent_cfg if isinstance(agent_cfg, dict) else {}
 
 
-__all__ = ["CODING_VERIFY_GUIDANCE", "DEFAULT_MAX_VERIFY_NUDGES", "coding_verify_guidance", "max_verify_nudges"]
+__all__ = ["CODING_VERIFY_GUIDANCE", "DEFAULT_MAX_VERIFY_NUDGES", "coding_verify_guidance", "max_verify_nudges", "pre_verify_always"]

@@ -1,8 +1,8 @@
 """Empty / thinking-only final-response recovery ladder for the conversation turn loop.
 
 Runs when the model returned no visible text after ``<think>`` blocks. Ladder order is
-load-bearing: partial-stream recovery → reuse prior turn content (housekeeping tools only)
-→ one post-tool-call nudge → thinking-only prefill continuation (×2) → empty-response
+load-bearing: partial-stream recovery → reuse prior turn content (housekeeping tools only;
+``pre_verify`` hooks asked first when ``agent.pre_verify_always`` is on) → one post-tool-call nudge → thinking-only prefill continuation (×2) → empty-response
 retries (budgeted, deterministic-empty short-circuit) → fallback provider → terminal
 ``(empty)`` sentinel. Nothing here imports ``agent.conversation_loop`` at module level.
 """
@@ -165,6 +165,52 @@ def take_housekeeping_reply_line(agent: Any) -> Optional[str]:
     return final_response
 
 
+_HOUSEKEEPING_PRE_VERIFY_FLAG = "_housekeeping_pre_verify"
+
+
+def _housekeeping_pre_verify(
+    agent: Any, assistant_message: Any, finish_reason: str, messages: list[dict[str, Any]], reply: str,
+) -> bool:
+    """Ask ``pre_verify`` before an empty reply after a housekeeping round ends the turn on the
+    earlier line. Without this, that exit skips the stop gates a normal text stop runs. Only with
+    ``agent.pre_verify_always`` (default off), and bounded by ``max_verify_nudges`` like the stop
+    gate. True when a nudge pair was appended: ``(empty)`` assistant row, then the hook's message."""
+    try:
+        from agent.verify_hooks import pre_verify_always
+        from agent.turn_stop_gates import _pre_verify_nudge
+
+        if not pre_verify_always():
+            return False
+    except Exception:
+        logger.debug("housekeeping pre_verify check failed", exc_info=True)
+        return False
+    attempt = getattr(agent, "_pre_verify_nudges", 0)
+    nudge = _pre_verify_nudge(agent, reply, attempt)
+    if not nudge:
+        return False
+    agent._pre_verify_nudges = attempt + 1
+    # tool → assistant("(empty)") → user keeps role alternation; both rows are ephemeral
+    # scaffolding (never persisted) and are popped again if the turn ends on the reply line.
+    _empty_row = agent._build_assistant_message(assistant_message, finish_reason)
+    _empty_row["content"] = "(empty)"
+    _empty_row["_empty_recovery_synthetic"] = True
+    _empty_row[_HOUSEKEEPING_PRE_VERIFY_FLAG] = True
+    append_message(messages, _empty_row)
+    append_message(messages, {
+        "role": "user", "content": nudge, "_pre_verify_synthetic": True, _HOUSEKEEPING_PRE_VERIFY_FLAG: True,
+    })
+    agent._session_messages = messages
+    logger.info("Empty follow-up after housekeeping tools — pre_verify asked to continue (attempt %d)",
+                agent._pre_verify_nudges)
+    return True
+
+
+def _drop_housekeeping_pre_verify_rows(messages: list[dict[str, Any]]) -> None:
+    """Pop trailing ``_housekeeping_pre_verify`` nudge pairs before the reply line becomes final."""
+    while messages and isinstance(messages[-1], dict) and messages[-1].get(_HOUSEKEEPING_PRE_VERIFY_FLAG):
+        messages.pop()
+
+
 def recover_empty_response(
     agent: Any, assistant_message: Any, response: Any, finish_reason: str, *, final_response: Any,
     messages: list[dict[str, Any]], api_messages: Any, conversation_history: Any,
@@ -206,8 +252,13 @@ def recover_empty_response(
 
     # Prior turn had real content + ONLY housekeeping tools: model is done, reuse it.
     # With substantive tools it was mid-task narration and the empty reply is a choke;
-    # let the post-tool nudge handle it.
+    # let the post-tool nudge handle it. With ``agent.pre_verify_always`` the pre_verify
+    # hooks are asked first, as on any other text stop.
+    _reply = housekeeping_reply_line(agent)
+    if _reply is not None and _housekeeping_pre_verify(agent, assistant_message, finish_reason, messages, _reply):
+        return _verdict("continue")
     if (final := take_housekeeping_reply_line(agent)) is not None:
+        _drop_housekeeping_pre_verify_rows(messages)
         _turn_exit_reason = "fallback_prior_turn_content"
         logger.info("Empty follow-up after tool calls — using prior turn content as final response")
         agent._emit_diagnostic_status("↻ Empty response after tool calls — using earlier content as final answer")
